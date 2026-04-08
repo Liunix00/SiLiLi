@@ -1,0 +1,17 @@
+.DS_Store
+.cursor/
+.tmp/
+.venv/
+venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.mypy_cache/
+.idea/
+node_modules/
+dist/
+build/
+coverage/
+*.log
+.env
+.env.*

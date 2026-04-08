@@ -1,0 +1,18 @@
+{
+  "default": {
+    "model_ref": "Doubao-seed-1.8",
+    "params": {
+      "max_tokens": 8192,
+      "temperature": 0.8,
+      "top_k": 20,
+      "top_p": 0.95,
+      "reasoning_effort": "minimal",
+      "thinking": {
+        "type": "disabled"
+      }
+    },
+    "prompts": {
+      "chat1": "chat_prompt.j2"
+    }
+  }
+}

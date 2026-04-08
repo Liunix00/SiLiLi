@@ -1,0 +1,25 @@
+{
+  "agent": {
+    "model_ref": "Doubao-seed-2.0-Pro",
+    "params": {
+      "max_tokens": 8192,
+      "temperature": 0.3,
+      "top_p": 0.95
+    },
+    "prompts": {
+      "system": "prompts/agent_system.j2"
+    }
+  },
+  "generate": {
+    "model_ref": "Doubao-seed-1.8",
+    "params": {
+      "max_tokens": 8192,
+      "temperature": 0.5,
+      "top_p": 0.95
+    },
+    "prompts": {
+      "plan_update": "prompts/plan_update.j2",
+      "progress_update": "prompts/progress_update.j2"
+    }
+  }
+}

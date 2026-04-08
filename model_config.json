@@ -1,0 +1,17 @@
+{
+  "Doubao-seed-1.8": {
+    "MODEL_BASE_URL": "https://ark.cn-beijing.volces.com/api/v3",
+    "MODEL_NAME": "doubao-seed-1-8-251228",
+    "api_key_env": "DOUBAO_API_KEY"
+  },
+    "Doubao-seed-2.0-Pro": {
+    "MODEL_BASE_URL": "https://ark.cn-beijing.volces.com/api/v3",
+    "MODEL_NAME": "doubao-seed-2-0-pro-260215",
+    "api_key_env": "DOUBAO_API_KEY"
+  },
+    "Doubao-seed-1.6-flash": {
+    "MODEL_BASE_URL": "https://ark.cn-beijing.volces.com/api/v3",
+    "MODEL_NAME": "doubao-seed-1-6-flash-250828",
+    "api_key_env": "DOUBAO_API_KEY"
+  }
+}

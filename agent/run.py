@@ -89,6 +89,18 @@ async def cmd_run(
         tool_ctx=ctx,
     )
 
+    # 开跑前清理 RobotNote/Projects（或按 project_filter 只清对应子目录）
+    robot_projects_dir = robot_root / "Projects"
+    if project_filter:
+        target_clean = robot_projects_dir / project_filter
+        if target_clean.is_dir():
+            shutil.rmtree(target_clean)
+            logger.info("已清理 RobotNote/Projects/%s", project_filter)
+    else:
+        if robot_projects_dir.is_dir():
+            shutil.rmtree(robot_projects_dir)
+            logger.info("已清理 RobotNote/Projects/")
+
     print("=" * 60)
     print("  司理理 Agent 启动")
     print(f"  HumanNote: {human_root}")

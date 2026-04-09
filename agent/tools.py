@@ -184,6 +184,29 @@ async def tool_update_project(ctx: ToolContext, *, project_id: str = "", **_: An
         plan_content=new_plan,
     )
 
+    # --- Idea 提取 ---
+    ideas = _extract_ideas(relevant_steps, ctx.all_steps_content or "")
+    idea_filename = f"{project_id}-idea.md"
+    idea_written = False
+    if ideas:
+        old_idea_path = project_dir / idea_filename
+        old_idea = ""
+        if old_idea_path.is_file():
+            old_idea = old_idea_path.read_text(encoding="utf-8")
+
+        new_idea_parts: List[str] = [old_idea.rstrip()] if old_idea.strip() else [f"# {project_id} Ideas\n\n---\n"]
+        for date, items in ideas.items():
+            new_idea_parts.append(f"\n### {date}")
+            for item in items:
+                new_idea_parts.append(f"- {item}")
+        new_idea = "\n".join(new_idea_parts) + "\n"
+
+        out_dir = ctx.robot_root / "Projects" / project_id
+        out_dir.mkdir(parents=True, exist_ok=True)
+        (out_dir / idea_filename).write_text(new_idea, encoding="utf-8")
+        idea_written = True
+
+    # --- Diff 生成 ---
     plan_diff_raw = generate_unified_diff(
         old_plan, new_plan,
         f"HumanNote/Projects/{project_id}/{plan_filename}",
@@ -230,20 +253,32 @@ async def tool_update_project(ctx: ToolContext, *, project_id: str = "", **_: An
         summary_parts.append("progress 已更新")
     else:
         summary_parts.append("progress 无变更")
+    if idea_written:
+        summary_parts.append(f"idea 已追加 {sum(len(v) for v in ideas.values())} 条")
+    else:
+        summary_parts.append("idea 无新增")
+
+    output_files = [plan_filename, progress_filename, diff_plan_name, diff_progress_name]
+    if idea_written:
+        output_files.append(idea_filename)
 
     return (
         f"项目 {project_id} 处理完成（{', '.join(summary_parts)}）。\n"
         f"输出目录: RobotNote/Projects/{project_id}/\n"
-        f"文件: {plan_filename}, {progress_filename}, {diff_plan_name}, {diff_progress_name}"
+        f"文件: {', '.join(output_files)}"
     )
 
 
 def _extract_project_steps(all_steps: str, project_id: str) -> str:
-    """从全部 steps 中提取与指定项目相关的连续块。
+    """从全部 steps 中提取与指定项目相关的连续块，保留日期上下文。
 
     匹配规则（严格全称）：【001-问津】 或 [001-问津]。
     遇到其他项目标签或非缩进行时结束当前块。
+    日期标题行会在需要时插入输出，确保 LLM 能看到每条步骤的日期。
     """
+    date_heading_re = re.compile(
+        r"^##\s*\**\s*\d{4}[.\-/]\d{1,2}[.\-/]\d{1,2}"
+    )
     tag_re = re.compile(
         r"[\u3010\[]" + re.escape(project_id) + r"[\u3011\]]"
     )
@@ -251,8 +286,20 @@ def _extract_project_steps(all_steps: str, project_id: str) -> str:
 
     result_lines: List[str] = []
     in_block = False
+    current_date_line: Optional[str] = None
+    date_emitted = False
+
     for line in all_steps.splitlines():
+        if date_heading_re.match(line):
+            current_date_line = line
+            date_emitted = False
+            in_block = False
+            continue
+
         if tag_re.search(line):
+            if current_date_line and not date_emitted:
+                result_lines.append(current_date_line)
+                date_emitted = True
             in_block = True
             result_lines.append(line)
         elif any_tag_re.search(line):
@@ -263,6 +310,57 @@ def _extract_project_steps(all_steps: str, project_id: str) -> str:
             in_block = False
 
     return "\n".join(result_lines)
+
+
+def _extract_ideas(relevant_steps: str, all_steps_content: str) -> Dict[str, List[str]]:
+    """从 steps 中提取 idea 行及其所属日期。
+
+    返回 {日期字符串: [idea原文, ...]} 的有序字典。
+    需要在 all_steps_content 中查找日期上下文，因为 relevant_steps
+    只保留了项目标签行和缩进行，日期标题可能被过滤掉了。
+    """
+    date_heading_re = re.compile(
+        r"^##\s*\**\s*(\d{4})[.\-/](\d{1,2})[.\-/](\d{1,2})"
+    )
+    idea_re = re.compile(r"^\s*-\s*idea\s+(.+)", re.IGNORECASE)
+
+    date_for_line: Dict[int, str] = {}
+    if all_steps_content:
+        current_date = "未知日期"
+        for line in all_steps_content.splitlines():
+            m = date_heading_re.match(line)
+            if m:
+                current_date = f"{m.group(1)}.{int(m.group(2))}.{int(m.group(3))}"
+            date_for_line[id(line)] = current_date
+
+    current_date = "未知日期"
+    all_lines = (all_steps_content or "").splitlines()
+    line_date_map: List[str] = []
+    for line in all_lines:
+        m = date_heading_re.match(line)
+        if m:
+            current_date = f"{m.group(1)}.{int(m.group(2))}.{int(m.group(3))}"
+        line_date_map.append(current_date)
+
+    all_lines_set = {
+        (i, line): line_date_map[i]
+        for i, line in enumerate(all_lines)
+    }
+
+    ideas: Dict[str, List[str]] = {}
+    for line in relevant_steps.splitlines():
+        im = idea_re.match(line)
+        if not im:
+            continue
+        idea_text = im.group(1).strip()
+        found_date = "未知日期"
+        for i, al in enumerate(all_lines):
+            if line.strip() == al.strip():
+                found_date = line_date_map[i]
+                break
+        ideas.setdefault(found_date, []).append(idea_text)
+
+    return ideas
 
 
 async def _llm_generate(
@@ -338,7 +436,7 @@ TOOL_DESCRIPTIONS = {
     "list_projects": "list_projects() — 列出 HumanNote/Projects 下所有项目目录",
     "read_file": 'read_file(path="相对路径") — 读取 HumanNote 中指定文件内容',
     "read_all_steps": "read_all_steps() — 读取上次运行以来的全部工作步骤",
-    "update_project": 'update_project(project_id="001-问津") — 为指定项目生成更新的 plan/progress 及 diff，写入 RobotNote',
+    "update_project": 'update_project(project_id="001-问津") — 为指定项目生成更新的 plan/progress/idea 及 diff，写入 RobotNote',
     "save_run_time": "save_run_time() — 记录本次运行时间戳",
     "finish": 'finish(summary="总结文字") — 宣告本次运行完成',
 }

@@ -11,7 +11,7 @@
     }
   },
   "generate": {
-    "model_ref": "Doubao-seed-1.8",
+    "model_ref": "Doubao-seed-2.0-Pro",
     "params": {
       "max_tokens": 8192,
       "temperature": 0.5,
@@ -20,6 +20,29 @@
     "prompts": {
       "plan_update": "prompts/plan_update.j2",
       "progress_update": "prompts/progress_update.j2"
+    }
+  },
+  "review": {
+    "model_ref": "Doubao-seed-2.0-Pro",
+    "params": {
+      "max_tokens": 16384,
+      "temperature": 0.3,
+      "top_p": 0.95,
+      "reasoning_effort": "high"
+    },
+    "prompts": {
+      "review": "prompts/review.j2"
+    }
+  },
+  "revision": {
+    "model_ref": "Doubao-seed-2.0-Pro",
+    "params": {
+      "max_tokens": 8192,
+      "temperature": 0.3,
+      "top_p": 0.95
+    },
+    "prompts": {
+      "revision": "prompts/revision.j2"
     }
   }
 }

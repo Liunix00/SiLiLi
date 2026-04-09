@@ -52,11 +52,13 @@ async def cmd_run(
     project_filter: Optional[str] = None,
     person_filter: Optional[str] = None,
 ) -> None:
+    # Agent 编排 LLM
     agent_prompt, agent_params, agent_model_ref = load_workflow_prompt_params(
         _PARAM_CONFIG_PATH, preset="agent", prompt_name="system",
     )
     agent_llm = load_llm_client_from_model_config(_MODEL_CONFIG_PATH, agent_model_ref)
 
+    # 生成 LLM (plan/progress)
     plan_prompt, gen_params, gen_model_ref = load_workflow_prompt_params(
         _PARAM_CONFIG_PATH, preset="generate", prompt_name="plan_update",
     )
@@ -64,6 +66,24 @@ async def cmd_run(
         _PARAM_CONFIG_PATH, preset="generate", prompt_name="progress_update",
     )
     gen_llm = load_llm_client_from_model_config(_MODEL_CONFIG_PATH, gen_model_ref)
+
+    # 审阅 LLM (thinking mode)
+    review_prompt, review_params, review_model_ref = load_workflow_prompt_params(
+        _PARAM_CONFIG_PATH, preset="review", prompt_name="review",
+    )
+    review_llm = load_llm_client_from_model_config(
+        _MODEL_CONFIG_PATH, review_model_ref
+    )
+
+    # 修订 LLM
+    revision_prompt, revision_params, revision_model_ref = (
+        load_workflow_prompt_params(
+            _PARAM_CONFIG_PATH, preset="revision", prompt_name="revision",
+        )
+    )
+    revision_llm = load_llm_client_from_model_config(
+        _MODEL_CONFIG_PATH, revision_model_ref
+    )
 
     human_root = get_humannote_root()
     robot_root = _robot_root()
@@ -78,6 +98,12 @@ async def cmd_run(
         progress_prompt_template=progress_prompt,
         gen_params=gen_params,
         state_mgr=state_mgr,
+        review_llm_client=review_llm,
+        revision_llm_client=revision_llm,
+        review_prompt_template=review_prompt,
+        revision_prompt_template=revision_prompt,
+        review_params=review_params,
+        revision_params=revision_params,
         project_filter=project_filter,
         person_filter=person_filter,
     )
@@ -89,7 +115,7 @@ async def cmd_run(
         tool_ctx=ctx,
     )
 
-    # 开跑前清理 RobotNote/Projects（或按 project_filter 只清对应子目录）
+    # 开跑前清理 RobotNote/Projects
     robot_projects_dir = robot_root / "Projects"
     if project_filter:
         target_clean = robot_projects_dir / project_filter
@@ -111,6 +137,7 @@ async def cmd_run(
         print(f"  项目过滤: {project_filter}")
     if person_filter:
         print(f"  人员过滤: {person_filter}")
+    print(f"  最大审阅轮数: {ctx.max_review_rounds}")
     print("=" * 60)
 
     summary = await agent.run()
@@ -133,10 +160,7 @@ def _archive_one_project(
     human_root: Path,
     robot_root: Path,
 ) -> Tuple[bool, List[str]]:
-    """将单个人类项目目录与 RobotNote 输出对齐：旧版进 history，Robot 覆盖 Human。
-
-    返回 (成功, 输出行)。成功指 HumanNote 与 RobotNote 下均存在该项目目录。
-    """
+    """将单个人类项目目录与 RobotNote 输出对齐：旧版进 history，Robot 覆盖 Human。"""
     project_dir = human_root / "Projects" / project_id
     robot_project_dir = robot_root / "Projects" / project_id
 
@@ -248,7 +272,10 @@ def main() -> None:
     group.add_argument(
         "--archive", nargs="?", const=_ARCHIVE_ALL_SENTINEL, default=None,
         metavar="PROJECT_ID",
-        help="归档：旧版→history，RobotNote→HumanNote。省略 PROJECT_ID 时表示归档全部（仅 HumanNote 与 RobotNote 均存在对应目录的项目）",
+        help=(
+            "归档：旧版→history，RobotNote→HumanNote。"
+            "省略 PROJECT_ID 时表示归档全部"
+        ),
     )
     parser.add_argument(
         "--project", metavar="PROJECT_ID",

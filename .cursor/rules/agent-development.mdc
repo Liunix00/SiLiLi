@@ -1,0 +1,46 @@
+---
+description: 司理理 Agent 代码与 prompt 的开发规范
+globs: agent/**
+alwaysApply: false
+---
+
+# Agent 开发规范
+
+## 项目标识
+
+- 项目 ID 格式：`NNN-中文名`（如 `001-问津`、`002-灵枢`）
+- Steps 中用 `【001-问津】` 或 `[001-问津]` 标注项目归属
+- 提取逻辑必须严格全称匹配，不能用短名或模糊匹配
+
+## Steps 标记语义
+
+`done` / `todo` / `blocked by` / `unblock` / `idea` / `plan` / `risk` 各有明确的 Plan 影响规则，定义在 `agent/prompts/plan_update.j2` 中。修改标记处理逻辑时必须同步更新 prompt 和 `tools.py` 中的提取代码。
+
+## Plan 格式
+
+```
+父任务：- T-NNN-NNN 名称 ｜ owner, MM/DD → MM/DD, Xd, 状态
+子任务：  - T-NNN-NNN-NN 名称 ｜ Xd, 状态（缩进2格，省略owner/时间）
+```
+
+状态只用 4 种：✅ 已完成 / 🟡 进行中 / 🔴 阻塞 / ⚪ 未开始
+
+## 工具注册模式
+
+新增工具时必须同时更新 `tools.py` 中的两处：
+1. `TOOL_REGISTRY` 字典（函数映射）
+2. `TOOL_DESCRIPTIONS` 字典（Agent 可见的描述文本）
+
+## Prompt 模板
+
+- 位于 `agent/prompts/*.j2`，Jinja2 格式
+- `agent_system.j2` 的变量由 `core.py` 的 `_build_system_prompt` 注入
+- `plan_update.j2` 和 `progress_update.j2` 的内容作为 system prompt 传入，用户消息由 `tools.py` 的 `_llm_generate` 拼装
+
+## 测试验证
+
+修改 agent 代码或 prompt 后，用限定范围命令验证：
+```bash
+PYTHONPATH=. python agent/run.py --run --project 001-问津 --person 刘玮康
+```
+然后检查 `RobotNote/Projects/001-问津/` 下的输出文件和 diff。

@@ -1,0 +1,55 @@
+---
+description: 司理理 Agent 代码与 prompt 的开发规范
+globs: agent/**
+alwaysApply: false
+---
+
+# Agent 开发规范
+
+## 项目标识
+
+- 项目 ID 格式：`NNN-中文名`（如 `001-问津`、`002-灵枢`）
+- Steps 中用 `【001-问津】` 或 `[001-问津]` 标注项目归属
+- 提取逻辑必须严格全称匹配，不能用短名或模糊匹配
+
+## Steps 标记语义
+
+`done` / `todo` / `blocked by` / `unblock` / `idea` / `plan` / `risk` 各有明确的 Plan 影响规则，定义在 `agent/prompts/plan_update.j2` 中。Steps 的结构化解析由 `agent/step_parser.py` 负责（纯代码，不使用 LLM）。修改标记处理逻辑时必须同步更新 `step_parser.py`、prompt 和 `tools.py`。
+
+## Plan 格式
+
+```
+父任务：- T-NNN-NNN 名称 ｜ owner, MM/DD → MM/DD, Xd, 状态
+子任务：  - T-NNN-NNN-NN 名称 ｜ Xd, 状态（缩进2格，省略owner/时间）
+```
+
+状态只用 4 种：✅ 已完成 / 🟡 进行中 / 🔴 阻塞 / ⚪ 未开始
+
+## 工具注册模式
+
+新增工具时必须同时更新 `tools.py` 中的两处：
+1. `TOOL_REGISTRY` 字典（函数映射）
+2. `TOOL_DESCRIPTIONS` 字典（Agent 可见的描述文本）
+
+## 架构概览
+
+- Steps 解析：`step_parser.py`（纯代码，结构化解析为 StepEntry/StepAction）
+- 并行处理：`update_all_projects` / `review_all_projects` / `revise_all_projects` 三个批量工具通过 `asyncio.gather` 并行处理所有活跃项目
+- 审阅-修订循环：最多 `max_review_rounds` 轮，审阅使用 thinking mode（`reasoning_effort: high`）
+- Diff 格式：语义化变更摘要 + unified diff 附录（见 `diff_utils.py`）
+
+## Prompt 模板
+
+- 位于 `agent/prompts/*.j2`，Jinja2 格式
+- `agent_system.j2` 的变量由 `core.py` 的 `_build_system_prompt` 注入
+- `plan_update.j2` / `progress_update.j2` — 生成 plan/progress 的 system prompt
+- `review.j2` — 审阅 prompt（完整性 + 质量，使用 thinking mode）
+- `revision.j2` — 修订 prompt（根据审阅意见执行修改）
+
+## 测试验证
+
+修改 agent 代码或 prompt 后，用限定范围命令验证：
+```bash
+PYTHONPATH=. python agent/run.py --run --project 001-问津 --person 刘玮康
+```
+然后检查 `RobotNote/Projects/001-问津/` 下的输出文件和 diff。

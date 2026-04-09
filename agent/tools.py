@@ -1,6 +1,7 @@
 """司理理 Agent 工具注册表与实现。"""
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 import re
@@ -13,8 +14,18 @@ from base_structure.llms.conversation_system import ConversationRequest
 from base_structure.llms.llm_client import AsyncOpenAIClient
 from base_structure.utils.readonly_fs import get_humannote_root
 
-from agent.diff_utils import generate_unified_diff, wrap_diff_as_markdown
+from agent.diff_utils import (
+    generate_semantic_diff,
+    generate_unified_diff,
+    wrap_diff_as_markdown,
+)
 from agent.state_manager import StateManager
+from agent.step_parser import (
+    StepEntry,
+    extract_ideas,
+    format_steps_for_llm,
+    parse_all_steps,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -27,6 +38,38 @@ def _robot_root() -> Path:
         p = Path(raw).expanduser()
         return p.resolve() if p.is_absolute() else (Path.cwd() / p).resolve()
     return (_REPO_ROOT / "RobotNote").resolve()
+
+
+# ---------------------------------------------------------------------------
+# 运行时数据结构
+# ---------------------------------------------------------------------------
+
+@dataclass
+class ProjectOutput:
+    """单个项目的生成结果，供审阅/修订使用。"""
+    project_id: str
+    old_plan: str
+    old_progress: str
+    new_plan: str
+    new_progress: str
+    plan_semantic_diff: str
+    progress_semantic_diff: str
+    plan_unified_diff: str
+    progress_unified_diff: str
+    ideas: Dict[str, List[str]]
+    formatted_steps: str
+    plan_filename: str
+    progress_filename: str
+
+
+@dataclass
+class ReviewResult:
+    """单个项目的审阅结果。"""
+    project_id: str
+    passed: bool
+    plan_issues: str
+    progress_issues: str
+    raw_feedback: str
 
 
 # ---------------------------------------------------------------------------
@@ -43,14 +86,27 @@ class ToolContext:
     progress_prompt_template: str
     gen_params: Dict[str, Any]
     state_mgr: StateManager
+    review_llm_client: AsyncOpenAIClient
+    revision_llm_client: AsyncOpenAIClient
+    review_prompt_template: str
+    revision_prompt_template: str
+    review_params: Dict[str, Any]
+    revision_params: Dict[str, Any]
+
     all_steps_content: Optional[str] = None
     today: str = field(default_factory=lambda: datetime.now().strftime("%Y-%m-%d"))
     project_filter: Optional[str] = None
     person_filter: Optional[str] = None
+    max_review_rounds: int = 3
+
+    parsed_steps: Dict[str, List[StepEntry]] = field(default_factory=dict)
+    project_outputs: Dict[str, ProjectOutput] = field(default_factory=dict)
+    review_feedback: Dict[str, ReviewResult] = field(default_factory=dict)
+    review_round: int = 0
 
 
 # ---------------------------------------------------------------------------
-# 工具实现
+# 基础工具（保持不变）
 # ---------------------------------------------------------------------------
 
 async def tool_list_projects(ctx: ToolContext, **_: Any) -> str:
@@ -80,6 +136,11 @@ async def tool_read_file(ctx: ToolContext, *, path: str = "", **_: Any) -> str:
         return f"读取失败: {exc}"
 
 
+_DATE_HEADING_RE = re.compile(
+    r"^##\s*\**\s*(\d{4})[.\-/](\d{1,2})[.\-/](\d{1,2})"
+)
+
+
 async def tool_read_all_steps(ctx: ToolContext, **_: Any) -> str:
     """读取上次运行以来的所有 steps，按日期过滤条目。"""
     steps_dir = ctx.human_root / "Steps"
@@ -90,10 +151,7 @@ async def tool_read_all_steps(ctx: ToolContext, **_: Any) -> str:
 
     md_files: List[Path] = sorted(steps_dir.rglob("*.md"))
     if ctx.person_filter:
-        md_files = [
-            f for f in md_files
-            if ctx.person_filter in str(f)
-        ]
+        md_files = [f for f in md_files if ctx.person_filter in str(f)]
     if not md_files:
         return "Steps 目录下无匹配的 .md 文件"
 
@@ -106,27 +164,23 @@ async def tool_read_all_steps(ctx: ToolContext, **_: Any) -> str:
             collected.append(f"=== {rel} ===\n{filtered}")
 
     if not collected:
-        hint = f"（上次运行: {last_run.isoformat()}）" if last_run else "（首次运行，无过滤）"
+        hint = (
+            f"（上次运行: {last_run.isoformat()}）"
+            if last_run
+            else "（首次运行，无过滤）"
+        )
         return f"没有找到新的步骤记录 {hint}"
 
     ctx.all_steps_content = "\n\n".join(collected)
     return ctx.all_steps_content
 
 
-_DATE_HEADING_RE = re.compile(
-    r"^##\s*\**\s*(\d{4})[.\-/](\d{1,2})[.\-/](\d{1,2})"
-)
-
-
 def _filter_steps_by_date(text: str, since: Optional[datetime]) -> str:
-    """保留 since 之后（含）的日期段落；since 为 None 时返回全部。"""
     if since is None:
         return text
-
     lines = text.splitlines(keepends=True)
     result: List[str] = []
     include = False
-
     for line in lines:
         m = _DATE_HEADING_RE.match(line)
         if m:
@@ -137,39 +191,77 @@ def _filter_steps_by_date(text: str, since: Optional[datetime]) -> str:
                 include = True
         if include:
             result.append(line)
-
     return "".join(result)
 
 
-async def tool_update_project(ctx: ToolContext, *, project_id: str = "", **_: Any) -> str:
-    """为指定项目生成更新后的 plan/progress/diff，写入 RobotNote。"""
-    if not project_id:
-        return "错误：请提供 project_id 参数（如 '001-问津'）"
+# ---------------------------------------------------------------------------
+# update_all_projects：并行生成所有活跃项目的 plan/progress
+# ---------------------------------------------------------------------------
 
-    projects_dir = ctx.human_root / "Projects"
-    project_dir = projects_dir / project_id
+async def tool_update_all_projects(ctx: ToolContext, **_: Any) -> str:
+    """代码解析 steps → 并行 LLM 生成所有活跃项目的 plan/progress/idea → 写入 RobotNote。"""
+    if not ctx.all_steps_content:
+        return "错误：请先调用 read_all_steps 读取步骤"
+
+    parsed = parse_all_steps(ctx.all_steps_content)
+    ctx.parsed_steps = parsed
+
+    if not parsed:
+        return "近期步骤中未涉及任何项目，无需更新"
+
+    active_ids = sorted(parsed.keys())
+    if ctx.project_filter:
+        active_ids = [p for p in active_ids if p == ctx.project_filter]
+
+    if not active_ids:
+        return "过滤后无匹配项目"
+
+    tasks = [
+        _process_single_project(ctx, pid, parsed[pid])
+        for pid in active_ids
+    ]
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+
+    summary_lines: List[str] = []
+    for pid, result in zip(active_ids, results):
+        if isinstance(result, Exception):
+            logger.error("项目 %s 处理失败: %s", pid, result, exc_info=result)
+            summary_lines.append(f"- {pid}: 处理失败（{result}）")
+        else:
+            summary_lines.append(f"- {pid}: {result}")
+
+    return f"所有项目处理完成（共 {len(active_ids)} 个）：\n" + "\n".join(
+        summary_lines
+    )
+
+
+async def _process_single_project(
+    ctx: ToolContext,
+    project_id: str,
+    entries: List[StepEntry],
+) -> str:
+    """处理单个项目：LLM 生成 plan → progress，提取 idea，写文件。"""
+    project_dir = ctx.human_root / "Projects" / project_id
     if not project_dir.is_dir():
-        return f"错误：项目目录不存在 - {project_id}"
+        return "项目目录不存在"
 
     plan_files = list(project_dir.glob("*-plan.md"))
     progress_files = list(project_dir.glob("*-progress.md"))
     if not plan_files or not progress_files:
-        return f"错误：项目 {project_id} 缺少 plan.md 或 progress.md"
+        return "缺少 plan.md 或 progress.md"
 
     old_plan = plan_files[0].read_text(encoding="utf-8")
     old_progress = progress_files[0].read_text(encoding="utf-8")
     plan_filename = plan_files[0].name
     progress_filename = progress_files[0].name
 
-    relevant_steps = _extract_project_steps(ctx.all_steps_content or "", project_id)
-    if not relevant_steps.strip():
-        return f"项目 {project_id} 在近期步骤中未被提及，跳过更新"
+    formatted_steps = format_steps_for_llm(entries)
 
     new_plan = await _llm_generate(
         ctx,
         ctx.plan_prompt_template,
         old_content=old_plan,
-        steps=relevant_steps,
+        steps=formatted_steps,
         doc_type="plan",
         project_id=project_id,
     )
@@ -178,189 +270,406 @@ async def tool_update_project(ctx: ToolContext, *, project_id: str = "", **_: An
         ctx,
         ctx.progress_prompt_template,
         old_content=old_progress,
-        steps=relevant_steps,
+        steps=formatted_steps,
         doc_type="progress",
         project_id=project_id,
         plan_content=new_plan,
     )
 
-    # --- Idea 提取 ---
-    ideas = _extract_ideas(relevant_steps, ctx.all_steps_content or "")
-    idea_filename = f"{project_id}-idea.md"
-    idea_written = False
-    if ideas:
-        old_idea_path = project_dir / idea_filename
-        old_idea = ""
-        if old_idea_path.is_file():
-            old_idea = old_idea_path.read_text(encoding="utf-8")
+    ideas = extract_ideas(entries)
 
-        new_idea_parts: List[str] = [old_idea.rstrip()] if old_idea.strip() else [f"# {project_id} Ideas\n\n---\n"]
-        for date, items in ideas.items():
-            new_idea_parts.append(f"\n### {date}")
-            for item in items:
-                new_idea_parts.append(f"- {item}")
-        new_idea = "\n".join(new_idea_parts) + "\n"
-
-        out_dir = ctx.robot_root / "Projects" / project_id
-        out_dir.mkdir(parents=True, exist_ok=True)
-        (out_dir / idea_filename).write_text(new_idea, encoding="utf-8")
-        idea_written = True
-
-    # --- Diff 生成 ---
-    plan_diff_raw = generate_unified_diff(
+    plan_semantic = generate_semantic_diff(old_plan, new_plan, "plan")
+    progress_semantic = generate_semantic_diff(old_progress, new_progress, "progress")
+    plan_unified = generate_unified_diff(
         old_plan, new_plan,
         f"HumanNote/Projects/{project_id}/{plan_filename}",
         f"RobotNote/Projects/{project_id}/{plan_filename}",
     )
-    progress_diff_raw = generate_unified_diff(
+    progress_unified = generate_unified_diff(
         old_progress, new_progress,
         f"HumanNote/Projects/{project_id}/{progress_filename}",
         f"RobotNote/Projects/{project_id}/{progress_filename}",
     )
 
-    plan_diff_md = wrap_diff_as_markdown(
-        plan_diff_raw,
-        f"{project_id} Plan 变更记录",
-        f"HumanNote/Projects/{project_id}/{plan_filename}",
-        f"RobotNote/Projects/{project_id}/{plan_filename}",
+    ctx.project_outputs[project_id] = ProjectOutput(
+        project_id=project_id,
+        old_plan=old_plan,
+        old_progress=old_progress,
+        new_plan=new_plan,
+        new_progress=new_progress,
+        plan_semantic_diff=plan_semantic,
+        progress_semantic_diff=progress_semantic,
+        plan_unified_diff=plan_unified,
+        progress_unified_diff=progress_unified,
+        ideas=ideas,
+        formatted_steps=formatted_steps,
+        plan_filename=plan_filename,
+        progress_filename=progress_filename,
     )
-    progress_diff_md = wrap_diff_as_markdown(
-        progress_diff_raw,
-        f"{project_id} Progress 变更记录",
-        f"HumanNote/Projects/{project_id}/{progress_filename}",
-        f"RobotNote/Projects/{project_id}/{progress_filename}",
+
+    _write_project_outputs(ctx, project_id)
+
+    summary_parts = []
+    summary_parts.append("plan 已更新" if plan_unified.strip() else "plan 无变更")
+    summary_parts.append(
+        "progress 已更新" if progress_unified.strip() else "progress 无变更"
     )
+    if ideas:
+        total = sum(len(v) for v in ideas.values())
+        summary_parts.append(f"idea 已追加 {total} 条")
+    return "，".join(summary_parts)
+
+
+# ---------------------------------------------------------------------------
+# review_all_projects：并行审阅所有活跃项目
+# ---------------------------------------------------------------------------
+
+async def tool_review_all_projects(ctx: ToolContext, **_: Any) -> str:
+    """并行审阅所有已生成的项目，返回审阅结果。"""
+    if not ctx.project_outputs:
+        return "错误：没有可审阅的项目，请先调用 update_all_projects"
+
+    ctx.review_round += 1
+    project_ids = sorted(ctx.project_outputs.keys())
+
+    tasks = [_review_single_project(ctx, pid) for pid in project_ids]
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+
+    all_passed = True
+    summary_lines: List[str] = []
+    for pid, result in zip(project_ids, results):
+        if isinstance(result, Exception):
+            logger.error("审阅 %s 失败: %s", pid, result, exc_info=result)
+            summary_lines.append(f"- {pid}: 审阅失败（{result}）")
+            all_passed = False
+        else:
+            ctx.review_feedback[pid] = result
+            status = "PASS" if result.passed else "NEEDS_REVISION"
+            summary_lines.append(f"- {pid}: {status}")
+            if not result.passed:
+                all_passed = False
+                if result.plan_issues and result.plan_issues != "无":
+                    summary_lines.append(f"  Plan: {result.plan_issues[:200]}")
+                if result.progress_issues and result.progress_issues != "无":
+                    summary_lines.append(
+                        f"  Progress: {result.progress_issues[:200]}"
+                    )
+
+    # 将审阅报告写入 RobotNote
+    for pid in project_ids:
+        if pid in ctx.review_feedback:
+            _write_review_report(ctx, pid)
+
+    verdict = "全部通过" if all_passed else "部分需要人工修订"
+    return (
+        f"审阅完成（{verdict}），审阅报告已写入 RobotNote：\n"
+        + "\n".join(summary_lines)
+    )
+
+
+async def _review_single_project(
+    ctx: ToolContext, project_id: str
+) -> ReviewResult:
+    out = ctx.project_outputs[project_id]
+
+    user_parts = [
+        f"# 项目: {project_id}",
+        "",
+        "## 结构化 Steps（输入源）",
+        out.formatted_steps,
+        "",
+        "## 生成的 Plan",
+        out.new_plan,
+        "",
+        "## 生成的 Progress",
+        out.new_progress,
+        "",
+        "## Plan 变更摘要",
+        out.plan_semantic_diff,
+        "",
+        "## Progress 变更摘要",
+        out.progress_semantic_diff,
+    ]
+    user_msg = "\n\n".join(user_parts)
+
+    request = ConversationRequest(
+        system_prompt=ctx.review_prompt_template,
+        user_question=user_msg,
+    )
+    messages = request()
+
+    try:
+        response = await ctx.review_llm_client.generate(
+            messages=messages,
+            stream=False,
+            **ctx.review_params,
+        )
+    except Exception as exc:
+        logger.error("审阅 LLM 调用失败（%s）: %s", project_id, exc)
+        return ReviewResult(
+            project_id=project_id,
+            passed=False,
+            plan_issues="审阅 LLM 调用失败",
+            progress_issues="审阅 LLM 调用失败",
+            raw_feedback=str(exc),
+        )
+
+    return _parse_review_response(project_id, response)
+
+
+def _parse_review_response(project_id: str, response: str) -> ReviewResult:
+    text = response.strip()
+    passed = "VERDICT: PASS" in text.upper() or "VERDICT:PASS" in text.upper()
+
+    plan_issues = "无"
+    progress_issues = "无"
+
+    plan_m = re.search(
+        r"PLAN_ISSUES:\s*\n(.*?)(?=PROGRESS_ISSUES:|$)",
+        text,
+        re.DOTALL | re.IGNORECASE,
+    )
+    if plan_m:
+        plan_issues = plan_m.group(1).strip()
+
+    progress_m = re.search(
+        r"PROGRESS_ISSUES:\s*\n(.*?)$",
+        text,
+        re.DOTALL | re.IGNORECASE,
+    )
+    if progress_m:
+        progress_issues = progress_m.group(1).strip()
+
+    if plan_issues == "无" and progress_issues == "无":
+        passed = True
+
+    return ReviewResult(
+        project_id=project_id,
+        passed=passed,
+        plan_issues=plan_issues,
+        progress_issues=progress_issues,
+        raw_feedback=text,
+    )
+
+
+def _write_review_report(ctx: ToolContext, project_id: str) -> None:
+    """将审阅报告写入 RobotNote/{project_id}-review.md。"""
+    review = ctx.review_feedback[project_id]
+    verdict = "PASS" if review.passed else "NEEDS_REVISION"
+    today_str = datetime.now().strftime("%Y-%m-%d")
+
+    parts = [
+        f"# {project_id} 审阅报告",
+        f"> 审阅时间：{today_str}",
+        f"> 结论：{verdict}",
+    ]
+
+    if review.passed:
+        parts.append("\n审阅通过，无需修改。")
+    else:
+        parts.append(f"\n## Plan 问题\n\n{review.plan_issues}")
+        parts.append(f"\n## Progress 问题\n\n{review.progress_issues}")
 
     out_dir = ctx.robot_root / "Projects" / project_id
     out_dir.mkdir(parents=True, exist_ok=True)
-
-    (out_dir / plan_filename).write_text(new_plan, encoding="utf-8")
-    (out_dir / progress_filename).write_text(new_progress, encoding="utf-8")
-
-    diff_plan_name = plan_filename.replace("-plan.md", "-plan_diff.md")
-    diff_progress_name = progress_filename.replace("-progress.md", "-progress_diff.md")
-    (out_dir / diff_plan_name).write_text(plan_diff_md, encoding="utf-8")
-    (out_dir / diff_progress_name).write_text(progress_diff_md, encoding="utf-8")
-
-    has_plan_change = bool(plan_diff_raw.strip())
-    has_progress_change = bool(progress_diff_raw.strip())
-    summary_parts = []
-    if has_plan_change:
-        summary_parts.append("plan 已更新")
-    else:
-        summary_parts.append("plan 无变更")
-    if has_progress_change:
-        summary_parts.append("progress 已更新")
-    else:
-        summary_parts.append("progress 无变更")
-    if idea_written:
-        summary_parts.append(f"idea 已追加 {sum(len(v) for v in ideas.values())} 条")
-    else:
-        summary_parts.append("idea 无新增")
-
-    output_files = [plan_filename, progress_filename, diff_plan_name, diff_progress_name]
-    if idea_written:
-        output_files.append(idea_filename)
-
-    return (
-        f"项目 {project_id} 处理完成（{', '.join(summary_parts)}）。\n"
-        f"输出目录: RobotNote/Projects/{project_id}/\n"
-        f"文件: {', '.join(output_files)}"
+    (out_dir / f"{project_id}-review.md").write_text(
+        "\n".join(parts) + "\n", encoding="utf-8"
     )
 
 
-def _extract_project_steps(all_steps: str, project_id: str) -> str:
-    """从全部 steps 中提取与指定项目相关的连续块，保留日期上下文。
+# ---------------------------------------------------------------------------
+# revise_all_projects：并行修订所有需要修订的项目（当前未启用，保留代码以备将来使用）
+# ---------------------------------------------------------------------------
 
-    匹配规则（严格全称）：【001-问津】 或 [001-问津]。
-    遇到其他项目标签或非缩进行时结束当前块。
-    日期标题行会在需要时插入输出，确保 LLM 能看到每条步骤的日期。
-    """
-    date_heading_re = re.compile(
-        r"^##\s*\**\s*\d{4}[.\-/]\d{1,2}[.\-/]\d{1,2}"
-    )
-    tag_re = re.compile(
-        r"[\u3010\[]" + re.escape(project_id) + r"[\u3011\]]"
-    )
-    any_tag_re = re.compile(r"[\u3010\[]\d{3}-[^\u3011\]]+[\u3011\]]")
+async def tool_revise_all_projects(ctx: ToolContext, **_: Any) -> str:
+    """根据审阅意见并行修订需要修订的项目。"""
+    if not ctx.review_feedback:
+        return "错误：没有审阅结果，请先调用 review_all_projects"
 
-    result_lines: List[str] = []
-    in_block = False
-    current_date_line: Optional[str] = None
-    date_emitted = False
+    to_revise = [
+        pid
+        for pid, review in ctx.review_feedback.items()
+        if not review.passed
+    ]
+    if not to_revise:
+        return "所有项目已通过审阅，无需修订"
 
-    for line in all_steps.splitlines():
-        if date_heading_re.match(line):
-            current_date_line = line
-            date_emitted = False
-            in_block = False
-            continue
+    tasks = [_revise_single_project(ctx, pid) for pid in to_revise]
+    results = await asyncio.gather(*tasks, return_exceptions=True)
 
-        if tag_re.search(line):
-            if current_date_line and not date_emitted:
-                result_lines.append(current_date_line)
-                date_emitted = True
-            in_block = True
-            result_lines.append(line)
-        elif any_tag_re.search(line):
-            in_block = False
-        elif in_block and line.startswith("    "):
-            result_lines.append(line)
+    summary_lines: List[str] = []
+    for pid, result in zip(to_revise, results):
+        if isinstance(result, Exception):
+            logger.error("修订 %s 失败: %s", pid, result, exc_info=result)
+            summary_lines.append(f"- {pid}: 修订失败（{result}）")
         else:
-            in_block = False
+            summary_lines.append(f"- {pid}: {result}")
 
-    return "\n".join(result_lines)
-
-
-def _extract_ideas(relevant_steps: str, all_steps_content: str) -> Dict[str, List[str]]:
-    """从 steps 中提取 idea 行及其所属日期。
-
-    返回 {日期字符串: [idea原文, ...]} 的有序字典。
-    需要在 all_steps_content 中查找日期上下文，因为 relevant_steps
-    只保留了项目标签行和缩进行，日期标题可能被过滤掉了。
-    """
-    date_heading_re = re.compile(
-        r"^##\s*\**\s*(\d{4})[.\-/](\d{1,2})[.\-/](\d{1,2})"
+    return f"修订完成（共 {len(to_revise)} 个项目）：\n" + "\n".join(
+        summary_lines
     )
-    idea_re = re.compile(r"^\s*-\s*idea\s+(.+)", re.IGNORECASE)
 
-    date_for_line: Dict[int, str] = {}
-    if all_steps_content:
-        current_date = "未知日期"
-        for line in all_steps_content.splitlines():
-            m = date_heading_re.match(line)
-            if m:
-                current_date = f"{m.group(1)}.{int(m.group(2))}.{int(m.group(3))}"
-            date_for_line[id(line)] = current_date
 
-    current_date = "未知日期"
-    all_lines = (all_steps_content or "").splitlines()
-    line_date_map: List[str] = []
-    for line in all_lines:
-        m = date_heading_re.match(line)
-        if m:
-            current_date = f"{m.group(1)}.{int(m.group(2))}.{int(m.group(3))}"
-        line_date_map.append(current_date)
+async def _revise_single_project(ctx: ToolContext, project_id: str) -> str:
+    out = ctx.project_outputs[project_id]
+    review = ctx.review_feedback[project_id]
 
-    all_lines_set = {
-        (i, line): line_date_map[i]
-        for i, line in enumerate(all_lines)
-    }
+    revised_plan = out.new_plan
+    revised_progress = out.new_progress
+    revised_any = False
 
-    ideas: Dict[str, List[str]] = {}
-    for line in relevant_steps.splitlines():
-        im = idea_re.match(line)
-        if not im:
-            continue
-        idea_text = im.group(1).strip()
-        found_date = "未知日期"
-        for i, al in enumerate(all_lines):
-            if line.strip() == al.strip():
-                found_date = line_date_map[i]
-                break
-        ideas.setdefault(found_date, []).append(idea_text)
+    if review.plan_issues and review.plan_issues != "无":
+        revised_plan = await _llm_revise(
+            ctx, out.new_plan, review.plan_issues, "plan", project_id
+        )
+        revised_any = True
 
-    return ideas
+    if review.progress_issues and review.progress_issues != "无":
+        revised_progress = await _llm_revise(
+            ctx,
+            out.new_progress,
+            review.progress_issues,
+            "progress",
+            project_id,
+            plan_content=revised_plan,
+        )
+        revised_any = True
+
+    if not revised_any:
+        return "无需修订"
+
+    plan_semantic = generate_semantic_diff(out.old_plan, revised_plan, "plan")
+    progress_semantic = generate_semantic_diff(
+        out.old_progress, revised_progress, "progress"
+    )
+    plan_unified = generate_unified_diff(
+        out.old_plan,
+        revised_plan,
+        f"HumanNote/Projects/{project_id}/{out.plan_filename}",
+        f"RobotNote/Projects/{project_id}/{out.plan_filename}",
+    )
+    progress_unified = generate_unified_diff(
+        out.old_progress,
+        revised_progress,
+        f"HumanNote/Projects/{project_id}/{out.progress_filename}",
+        f"RobotNote/Projects/{project_id}/{out.progress_filename}",
+    )
+
+    out.new_plan = revised_plan
+    out.new_progress = revised_progress
+    out.plan_semantic_diff = plan_semantic
+    out.progress_semantic_diff = progress_semantic
+    out.plan_unified_diff = plan_unified
+    out.progress_unified_diff = progress_unified
+
+    _write_project_outputs(ctx, project_id)
+
+    parts = []
+    if review.plan_issues != "无":
+        parts.append("plan 已修订")
+    if review.progress_issues != "无":
+        parts.append("progress 已修订")
+    return "，".join(parts) if parts else "已修订"
+
+
+async def _llm_revise(
+    ctx: ToolContext,
+    current_content: str,
+    issues: str,
+    doc_type: str,
+    project_id: str,
+    plan_content: Optional[str] = None,
+) -> str:
+    parts = [
+        f"# 项目: {project_id}",
+        f"# 文档类型: {doc_type}",
+        "",
+        f"## 当前文档内容\n\n{current_content}",
+        f"## 审阅意见\n\n{issues}",
+    ]
+    if plan_content is not None and doc_type == "progress":
+        parts.append(f"## 当前 plan（参考任务 ID 和名称）\n\n{plan_content}")
+    user_msg = "\n\n".join(parts)
+
+    request = ConversationRequest(
+        system_prompt=ctx.revision_prompt_template,
+        user_question=user_msg,
+    )
+    messages = request()
+
+    try:
+        response = await ctx.revision_llm_client.generate(
+            messages=messages,
+            stream=False,
+            **ctx.revision_params,
+        )
+    except Exception as exc:
+        logger.error("修订 LLM 调用失败（%s %s）: %s", doc_type, project_id, exc)
+        return current_content
+
+    return _strip_fenced_markdown(response)
+
+
+# ---------------------------------------------------------------------------
+# 公共辅助函数
+# ---------------------------------------------------------------------------
+
+def _write_project_outputs(ctx: ToolContext, project_id: str) -> None:
+    """将 ProjectOutput 写入 RobotNote 文件。"""
+    out = ctx.project_outputs[project_id]
+    out_dir = ctx.robot_root / "Projects" / project_id
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    (out_dir / out.plan_filename).write_text(out.new_plan, encoding="utf-8")
+    (out_dir / out.progress_filename).write_text(
+        out.new_progress, encoding="utf-8"
+    )
+
+    plan_diff_name = out.plan_filename.replace("-plan.md", "-plan_diff.md")
+    progress_diff_name = out.progress_filename.replace(
+        "-progress.md", "-progress_diff.md"
+    )
+
+    plan_diff_md = wrap_diff_as_markdown(
+        out.plan_semantic_diff,
+        out.plan_unified_diff,
+        f"{project_id} Plan 变更记录",
+        f"HumanNote/Projects/{project_id}/{out.plan_filename}",
+        f"RobotNote/Projects/{project_id}/{out.plan_filename}",
+    )
+    progress_diff_md = wrap_diff_as_markdown(
+        out.progress_semantic_diff,
+        out.progress_unified_diff,
+        f"{project_id} Progress 变更记录",
+        f"HumanNote/Projects/{project_id}/{out.progress_filename}",
+        f"RobotNote/Projects/{project_id}/{out.progress_filename}",
+    )
+
+    (out_dir / plan_diff_name).write_text(plan_diff_md, encoding="utf-8")
+    (out_dir / progress_diff_name).write_text(
+        progress_diff_md, encoding="utf-8"
+    )
+
+    if out.ideas:
+        idea_filename = f"{project_id}-idea.md"
+        project_dir = ctx.human_root / "Projects" / project_id
+        old_idea_path = project_dir / idea_filename
+        old_idea = ""
+        if old_idea_path.is_file():
+            old_idea = old_idea_path.read_text(encoding="utf-8")
+
+        idea_parts: List[str] = (
+            [old_idea.rstrip()]
+            if old_idea.strip()
+            else [f"# {project_id} Ideas\n\n---\n"]
+        )
+        for d, items in out.ideas.items():
+            idea_parts.append(f"\n### {d}")
+            for item in items:
+                idea_parts.append(f"- {item}")
+        (out_dir / idea_filename).write_text(
+            "\n".join(idea_parts) + "\n", encoding="utf-8"
+        )
 
 
 async def _llm_generate(
@@ -380,9 +689,12 @@ async def _llm_generate(
         f"## 当前 {doc_type}\n\n{old_content}",
     ]
     if plan_content is not None:
-        parts.append(f"## 当前 plan（用于确认任务 ID 和名称）\n\n{plan_content}")
+        parts.append(
+            f"## 当前 plan（用于确认任务 ID 和名称）\n\n{plan_content}"
+        )
     parts.append(f"## 近期相关步骤\n\n{steps}")
     user_msg = "\n\n".join(parts)
+
     request = ConversationRequest(
         system_prompt=prompt_template,
         user_question=user_msg,
@@ -427,7 +739,8 @@ TOOL_REGISTRY: Dict[str, ToolFunc] = {
     "list_projects": tool_list_projects,
     "read_file": tool_read_file,
     "read_all_steps": tool_read_all_steps,
-    "update_project": tool_update_project,
+    "update_all_projects": tool_update_all_projects,
+    "review_all_projects": tool_review_all_projects,
     "save_run_time": tool_save_run_time,
     "finish": tool_finish,
 }
@@ -436,7 +749,14 @@ TOOL_DESCRIPTIONS = {
     "list_projects": "list_projects() — 列出 HumanNote/Projects 下所有项目目录",
     "read_file": 'read_file(path="相对路径") — 读取 HumanNote 中指定文件内容',
     "read_all_steps": "read_all_steps() — 读取上次运行以来的全部工作步骤",
-    "update_project": 'update_project(project_id="001-问津") — 为指定项目生成更新的 plan/progress/idea 及 diff，写入 RobotNote',
+    "update_all_projects": (
+        "update_all_projects() — 代码解析 steps 并并行生成所有活跃项目的"
+        " plan/progress/idea 及 diff，写入 RobotNote"
+    ),
+    "review_all_projects": (
+        "review_all_projects() — 并行审阅所有已生成项目的 plan/progress"
+        " 质量与完整性，审阅报告写入 RobotNote 供人类参考"
+    ),
     "save_run_time": "save_run_time() — 记录本次运行时间戳",
     "finish": 'finish(summary="总结文字") — 宣告本次运行完成',
 }

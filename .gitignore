@@ -1,5 +1,7 @@
 .DS_Store
-.cursor/
+.cursor/*
+!.cursor/rules/
+!.cursor/skills/
 .tmp/
 .venv/
 venv/

@@ -1,0 +1,29 @@
+---
+description: HumanNote 是人类权威数据源，AI 助手禁止直接修改其中的文件
+globs: HumanNote/**
+alwaysApply: false
+---
+
+# HumanNote 只读约束
+
+`HumanNote/` 是人类维护的权威数据目录，包含项目计划、进展、灵感和工作步骤。
+
+## 禁止操作
+
+- 不要直接编辑、创建或删除 `HumanNote/` 下的任何文件
+- 不要用 shell 命令（cp、mv、sed 等）修改 HumanNote 内容
+- 归档操作只能通过 `python agent/run.py --archive` 执行
+
+## 正确做法
+
+所有对笔记内容的修改必须走完整流程：
+
+1. Agent 运行（`--run`）将产出写入 `RobotNote/`
+2. 人类在 `RobotNote/` 中审阅并定稿
+3. 归档命令（`--archive`）将定稿写回 `HumanNote/`
+
+## 例外
+
+- 人类可以手动编辑 `HumanNote/Steps/` 下的工作步骤文件（这是输入源）
+- 人类可以在审阅后手动微调 `HumanNote/Projects/` 下的文件
+- 这些操作由人类发起，不是 AI 助手的职责

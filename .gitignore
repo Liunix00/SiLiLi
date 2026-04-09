@@ -17,3 +17,15 @@ coverage/
 *.log
 .env
 .env.*
+
+# Notes (local / generated)
+# - HumanNote: 人类权威笔记（通常含隐私/大量变更，不建议入库）
+# - RobotNote: Agent 生成输出（每次 run 可能被覆盖）
+HumanNote/*
+!HumanNote/README.md
+!HumanNote/Steps/
+HumanNote/Steps/*
+!HumanNote/Steps/steps_guide.md
+
+RobotNote/*
+!RobotNote/README.md
